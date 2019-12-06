@@ -12,10 +12,17 @@ import yaml
 
 from recognition.backbones.resnet_v1 import ResNet_v1_50
 from recognition.data.generate_data import GenerateData
-from recognition.losses.loss import arcface_loss, triplet_loss, center_loss
+from recognition.losses.loss import arcface_loss, triplet_loss, center_loss, softmax_loss
+from recognition.losses.private_loss import p_arcface_loss, p_triplet_loss, p_center_loss, p_softmax_loss
 from recognition.models.models import MyModel
 from recognition.predict import get_embeddings
 from recognition.valid import Valid_Data
+
+from privacy.tensorflow_privacy.privacy.optimizers.dp_optimizer import make_gaussian_optimizer_class
+from privacy.tensorflow_privacy.privacy.optimizers.dp_optimizer import DPAdamGaussianOptimizer
+from privacy.tensorflow_privacy.privacy.analysis.rdp_accountant import compute_rdp
+from privacy.tensorflow_privacy.privacy.analysis.rdp_accountant import get_privacy_spent
+from privacy.tensorflow_privacy.privacy.optimizers.dp_optimizer import DPGradientDescentGaussianOptimizer
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = "2,3"
 # config = tf.ConfigProto()
@@ -25,12 +32,12 @@ from recognition.valid import Valid_Data
 
 tf.enable_eager_execution()
 
-
 # log_cfg_path = '../logging.yaml'
 # with open(log_cfg_path, 'r') as f:
 #     dict_cfg = yaml.load(f, Loader=yaml.FullLoader)
 # logging.config.dictConfig(dict_cfg)
 # logger = logging.getLogger("mylogger")
+
 
 class Trainer:
     def __init__(self, config):
@@ -50,6 +57,17 @@ class Trainer:
         self.learning_rate = config['learning_rate']
         self.loss_type = config['loss_type']
 
+        # DP params
+        self.dp_enabled = config['dp_enabled']
+        self.noise_multiplier = config['noise_multiplier']
+        self.l2_norm_clip = config['l2_norm_clip']
+        self.num_microbatches = config['num_microbatches']
+        self.steps_per_epoch = len([x for x in self.train_data])
+        self.batch_size = config['batch_size']
+        self.train_count = self.steps_per_epoch * config['batch_size']
+        print(f"Population size:\t{self.train_count}")
+        self.target_delta = config['target_delta']
+
         # center loss init
         self.centers = None
         self.ct_loss_factor = config['center_loss_factor']
@@ -59,25 +77,37 @@ class Trainer:
 
         optimizer = config['optimizer']
         if optimizer == 'ADADELTA':
-            self.optimizer = tf.keras.optimizers.Adadelta(self.learning_rate)
+            opt_cls = tf.keras.optimizers.Adadelta
         elif optimizer == 'ADAGRAD':
-            self.optimizer = tf.keras.optimizers.Adagrad(self.learning_rate)
+            opt_cls = tf.keras.optimizers.Adagrad
         elif optimizer == 'ADAM':
-            self.optimizer = tf.keras.optimizers.Adam(self.learning_rate)
+            opt_cls = tf.keras.optimizers.Adam
         elif optimizer == 'ADAMAX':
-            self.optimizer = tf.keras.optimizers.Adamax(self.learning_rate)
+            opt_cls = tf.keras.optimizers.Adamax
         elif optimizer == 'FTRL':
-            self.optimizer = tf.keras.optimizers.Ftrl(self.learning_rate)
+            opt_cls = tf.keras.optimizers.Ftrl
         elif optimizer == 'NADAM':
-            self.optimizer = tf.keras.optimizers.Nadam(self.learning_rate)
+            opt_cls = tf.keras.optimizers.Nadam
         elif optimizer == 'RMSPROP':
-            self.optimizer = tf.keras.optimizers.RMSprop(self.learning_rate)
+            opt_cls = tf.keras.optimizers.RMSprop
         elif optimizer == 'SGD':
-            self.optimizer = tf.keras.optimizers.SGD(self.learning_rate)
+            opt_cls = tf.keras.optimizers.SGD
         else:
             raise ValueError('Invalid optimization algorithm')
+       
+        if self.dp_enabled:
+            # opt_cls = make_gaussian_optimizer_class(opt_cls)
+            opt_cls = DPAdamGaussianOptimizer
+            self.optimizer = opt_cls(
+                    l2_norm_clip=self.l2_norm_clip, 
+                    noise_multiplier=self.noise_multiplier, 
+                    num_microbatches=self.num_microbatches, 
+                    learning_rate=self.learning_rate)
+        else:
+            self.optimizer = opt_cls(self.learning_rate)
 
         ckpt_dir = os.path.expanduser(config['ckpt_dir'])
+        
 
         if self.centers is None:
             self.ckpt = tf.train.Checkpoint(backbone=self.model.backbone, model=self.model, optimizer=self.optimizer)
@@ -118,24 +148,43 @@ class Trainer:
 
     @tf.function
     def _train_step(self, img, label):
-        with tf.GradientTape(persistent=False) as tape:
+        with tf.GradientTape(persistent=True) as tape:
             prelogits, dense, norm_dense = self.model(img, training=True)
 
             # sm_loss = softmax_loss(dense, label)
             # norm_sm_loss = softmax_loss(norm_dense, label)
-            arc_loss = arcface_loss(prelogits, norm_dense, label, self.m1, self.m2, self.m3, self.s)
-            logit_loss = arc_loss
+            # arc_loss = arcface_loss(prelogits, norm_dense, label, self.m1, self.m2, self.m3, self.s)
+            
+            if self.dp_enabled:
+                # _loss = p_softmax_loss(dense, label)
+                _loss = p_arcface_loss(prelogits, norm_dense, label, self.m1, self.m2, self.m3, self.s)
 
-            if self.centers is not None:
-                ct_loss, self.centers = center_loss(prelogits, label, self.centers, self.ct_alpha)
+                if self.centers is not None:
+                    ct_loss, self.centers = p_center_loss(prelogits, label, self.centers, self.ct_alpha)
+                else:
+                    ct_loss = [0] * int(_loss.shape[0])
+                    ct_loss = tf.convert_to_tensor(ct_loss, dtype=float)
+
             else:
-                ct_loss = 0
+                # _loss = softmax_loss(dense, label)
+                _loss = p_arcface_loss(prelogits, norm_dense, label, self.m1, self.m2, self.m3, self.s)
 
+                if self.centers is not None:
+                    ct_loss, self.centers = center_loss(prelogits, label, self.centers, self.ct_alpha)
+                else:
+                    ct_loss = 0           
+
+            logit_loss = _loss
             loss = logit_loss + self.ct_loss_factor * ct_loss
+
         gradients = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-
-        return loss, logit_loss, ct_loss
+        
+        # reduce for reporting only
+        if self.dp_enabled:
+            return tf.reduce_mean(loss), tf.reduce_mean(logit_loss), tf.reduce_mean(ct_loss)
+        else:
+            return loss, logit_loss, ct_loss
 
     @tf.function
     def _train_triplet_step(self, anchor, pos, neg):
@@ -143,13 +192,32 @@ class Trainer:
             anchor_emb = get_embeddings(self.model, anchor)
             pos_emb = get_embeddings(self.model, pos)
             neg_emb = get_embeddings(self.model, neg)
-
-            loss = triplet_loss(anchor_emb, pos_emb, neg_emb, self.alpha)
+            
+            if self.dp_enabled:
+                loss = p_triplet_loss(anchor_emb, pos_emb, neg_emb, self.alpha)
+            else:
+                loss = triplet_loss(anchor_emb, pos_emb, neg_emb, self.alpha)
 
         gradients = tape.gradient(loss, self.model.trainable_variables)
         self.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+        
+        # reduce for reporting only
+        if self.dp_enabled:
+            return tf.reduce_mean(loss)
+        else:
+            return loss
 
-        return loss
+    def compute_epsilon(self, steps):
+        if self.noise_multiplier == 0.0:
+            return float('inf')
+        orders = [1 + x / 10. for x in range(1, 100)] + list(range(12, 64))
+        sampling_probability = self.batch_size / self.train_count
+        rdp = compute_rdp(q=sampling_probability,
+                          noise_multiplier=self.noise_multiplier,
+                          steps=steps,
+                          orders=orders)
+        # target delta: rule of thumb is to set it to be less than the inverse of the training data size (i.e., the population size)
+        return get_privacy_spent(orders, rdp, target_delta=self.target_delta)[0]
 
     def train(self):
         for epoch in range(self.epoch_num):
@@ -190,9 +258,18 @@ class Trainer:
                 tf.compat.v2.summary.scalar('p_fpr', p_fpr, step=epoch)
                 tf.compat.v2.summary.scalar('r=tpr_fpr', r_fpr, step=epoch)
                 tf.compat.v2.summary.scalar('thresh_fpr', thresh_fpr, step=epoch)
-            print('epoch: {}, acc: {:.3f}, p: {:.3f}, r=tpr: {:.3f}, fpr: {:.3f} \n'
-                  'fix fpr <= {}, acc: {:.3f}, p: {:.3f}, r=tpr: {:.3f}, thresh: {:.3f}'
-                  .format(epoch, acc, p, r, fpr, self.below_fpr, acc_fpr, p_fpr, r_fpr, thresh_fpr))
+                if self.dp_enabled:
+                    eps = self.compute_epsilon((epoch + 1) * self.steps_per_epoch)
+                    tf.compat.v2.summary.scalar('eps', eps, step=epoch)
+
+                    print('epoch: {}, acc: {:.3f}, p: {:.3f}, r=tpr: {:.3f}, fpr: {:.3f} \n'
+                          'fix fpr <= {}, acc: {:.3f}, p: {:.3f}, r=tpr: {:.3f}, thresh: {:.3f}, eps: {:.3f}'
+                          .format(epoch, acc, p, r, fpr, self.below_fpr, acc_fpr, p_fpr, r_fpr, thresh_fpr, eps))
+                else:
+                    print('epoch: {}, acc: {:.3f}, p: {:.3f}, r=tpr: {:.3f}, fpr: {:.3f} \n'
+                          'fix fpr <= {}, acc: {:.3f}, p: {:.3f}, r=tpr: {:.3f}, thresh: {:.3f}'
+                          .format(epoch, acc, p, r, fpr, self.below_fpr, acc_fpr, p_fpr, r_fpr, thresh_fpr))
+
 
             # ckpt
             # if epoch % 5 == 0:
