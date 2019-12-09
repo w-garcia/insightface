@@ -42,5 +42,5 @@ below_fpr: 0.001        # fpr should below this
 train_dir: '/ufrc/butler/w.garcia/dataset/Georgia_Tech_Faces/mtcnnpy_160_split/train'
 valid_dir: '/ufrc/butler/w.garcia/dataset/Georgia_Tech_Faces/mtcnnpy_160_split/val'
 test_dir: '/ufrc/butler/w.garcia/dataset/Georgia_Tech_Faces/mtcnnpy_160_split/test'
-ckpt_dir: 'models/DP_delta-0.001_lr-0.01_emb-512'
-summary_dir: 'logs/DP_delta-0.001_lr-0.01_emb-512'
+ckpt_dir: 'models/DP_arcface_delta-0.001_lr-0.01_emb-512'
+summary_dir: 'logs/DP_arcface_delta-0.001_lr-0.01_emb-512'

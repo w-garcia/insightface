@@ -11,7 +11,7 @@ optimizer: 'ADAM'    # ADADELTA, ADAGRAD, ADAM, ADAMAX, FTRL, NADAM, RMSPROP, SG
 learning_rate: 0.01
 
 # DP params
-dp_enabled: True
+dp_enabled: False
 noise_multiplier: 1.3
 l2_norm_clip: 1.5
 num_microbatches: 256
@@ -42,5 +42,5 @@ below_fpr: 0.001        # fpr should below this
 train_dir: '/ufrc/butler/w.garcia/dataset/Georgia_Tech_Faces/mtcnnpy_160_split/train'
 valid_dir: '/ufrc/butler/w.garcia/dataset/Georgia_Tech_Faces/mtcnnpy_160_split/val'
 test_dir: '/ufrc/butler/w.garcia/dataset/Georgia_Tech_Faces/mtcnnpy_160_split/test'
-ckpt_dir: 'models/DP_delta-0.001_lr-0.01_emb-512'
-summary_dir: 'logs/DP_delta-0.001_lr-0.01_emb-512'
+ckpt_dir: 'models/arcface_lr-0.01_emb-512'
+summary_dir: 'logs/arcface_lr-0.01_emb-512'
