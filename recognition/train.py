@@ -167,7 +167,7 @@ class Trainer:
 
             else:
                 # _loss = softmax_loss(dense, label)
-                _loss = p_arcface_loss(prelogits, norm_dense, label, self.m1, self.m2, self.m3, self.s)
+                _loss = arcface_loss(prelogits, norm_dense, label, self.m1, self.m2, self.m3, self.s)
 
                 if self.centers is not None:
                     ct_loss, self.centers = center_loss(prelogits, label, self.centers, self.ct_alpha)
